@@ -22,6 +22,12 @@ export function ScreenCapture() {
   const intervalRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [stream]);
+
+  useEffect(() => {
     return () => {
       if (stream) {
         stream.getTracks().forEach((track) => track.stop());
@@ -35,16 +41,11 @@ export function ScreenCapture() {
   const startCapture = async () => {
     try {
       const mediaStream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          displaySurface: 'window',
-        },
+        video: true,
         audio: false,
       });
 
       setStream(mediaStream);
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-      }
 
       mediaStream.getVideoTracks()[0].addEventListener('ended', () => {
         stopCapture();
@@ -76,7 +77,7 @@ export function ScreenCapture() {
   };
 
   const captureFrame = async () => {
-    if (!videoRef.current || !canvasRef.current || !user) return;
+    if (!videoRef.current || !canvasRef.current || !user || !stream) return;
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -105,9 +106,15 @@ export function ScreenCapture() {
 
         if (uploadError) throw uploadError;
 
-        const { data: { publicUrl } } = supabase.storage
+        const { data } = supabase.storage
           .from('chart-captures')
           .getPublicUrl(filePath);
+
+        if (!data || !data.publicUrl) {
+            throw new Error('Failed to get public URL');
+        }
+        const publicUrl = data.publicUrl;
+
 
         const { error: dbError } = await supabase.from('chart_captures').insert({
           user_id: user.id,
