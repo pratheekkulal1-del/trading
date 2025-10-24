@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
-import { Monitor, Square, Play, Pause, Settings } from 'lucide-react';
+import { Monitor, Square, Play, Pause, Settings, Loader2 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
+import { OpenAIAnalyzer } from '../lib/openai';
 
 interface CaptureSettings {
   intervalSeconds: number;
@@ -17,6 +18,8 @@ export function ScreenCapture() {
     autoCapture: false,
   });
   const [lastCapture, setLastCapture] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisStatus, setAnalysisStatus] = useState<string>('');
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const intervalRef = useRef<number | null>(null);
@@ -76,6 +79,151 @@ export function ScreenCapture() {
     setIsCapturing(false);
   };
 
+  const extractPrice = (text: string): number | null => {
+    const matches = text.match(/\$?([0-9]+(?:[,.]?[0-9]+)*)/g);
+    if (matches && matches.length > 0) {
+      const price = parseFloat(matches[0].replace(/[$,]/g, ''));
+      return isNaN(price) ? null : price;
+    }
+    return null;
+  };
+
+  const extractStructuresFromAnalysis = (analysisText: string, timeframe: string) => {
+    const structures = [];
+    const lines = analysisText.toLowerCase().split('\n');
+
+    for (const line of lines) {
+      if (line.includes('choch') || line.includes('change of character')) {
+        const price = extractPrice(line);
+        if (price) {
+          structures.push({
+            type: 'choch',
+            direction: line.includes('bullish') ? 'bullish' : line.includes('bearish') ? 'bearish' : 'neutral',
+            priceLevel: price,
+            confidence: 0.8,
+            coordinates: { x: 0, y: 0, width: 0, height: 0 }
+          });
+        }
+      }
+      if (line.includes('bos') || line.includes('break of structure')) {
+        const price = extractPrice(line);
+        if (price) {
+          structures.push({
+            type: 'bos',
+            direction: line.includes('bullish') ? 'bullish' : line.includes('bearish') ? 'bearish' : 'neutral',
+            priceLevel: price,
+            confidence: 0.85,
+            coordinates: { x: 0, y: 0, width: 0, height: 0 }
+          });
+        }
+      }
+      if (line.includes('order block')) {
+        const price = extractPrice(line);
+        if (price) {
+          structures.push({
+            type: 'order_block',
+            direction: line.includes('bullish') || line.includes('demand') ? 'bullish' : line.includes('bearish') || line.includes('supply') ? 'bearish' : 'neutral',
+            priceLevel: price,
+            confidence: 0.75,
+            coordinates: { x: 0, y: 0, width: 0, height: 0 }
+          });
+        }
+      }
+      if (line.includes('liquidity') || line.includes('pool')) {
+        const price = extractPrice(line);
+        if (price) {
+          structures.push({
+            type: 'liquidity',
+            direction: line.includes('above') ? 'bullish' : line.includes('below') ? 'bearish' : 'neutral',
+            priceLevel: price,
+            confidence: 0.7,
+            coordinates: { x: 0, y: 0, width: 0, height: 0 }
+          });
+        }
+      }
+      if (line.includes('poi') || line.includes('point of interest')) {
+        const price = extractPrice(line);
+        if (price) {
+          structures.push({
+            type: 'poi',
+            direction: 'neutral',
+            priceLevel: price,
+            confidence: 0.8,
+            coordinates: { x: 0, y: 0, width: 0, height: 0 }
+          });
+        }
+      }
+      if (line.includes('fib') && (line.includes('50') || line.includes('0.5'))) {
+        const price = extractPrice(line);
+        if (price) {
+          structures.push({
+            type: 'fib_50',
+            direction: 'neutral',
+            priceLevel: price,
+            confidence: 0.75,
+            coordinates: { x: 0, y: 0, width: 0, height: 0 }
+          });
+        }
+      }
+    }
+
+    return structures;
+  };
+
+  const analyzeCapture = async (imageBase64: string, captureId: string) => {
+    try {
+      setAnalysisStatus('Analyzing chart...');
+
+      const { data: settingsData } = await supabase
+        .from('user_settings')
+        .select('openai_api_key')
+        .eq('user_id', user?.id)
+        .maybeSingle();
+
+      if (!settingsData?.openai_api_key) {
+        setAnalysisStatus('OpenAI API key not configured');
+        setTimeout(() => setAnalysisStatus(''), 3000);
+        return;
+      }
+
+      const analyzer = new OpenAIAnalyzer(settingsData.openai_api_key);
+
+      const timeframes = ['4h', '15m', '3m', '1m'] as const;
+
+      for (const timeframe of timeframes) {
+        setAnalysisStatus(`Analyzing ${timeframe} timeframe...`);
+        const analysis = await analyzer.analyzeChart(imageBase64, timeframe);
+
+        const structures = extractStructuresFromAnalysis(analysis.analysis, timeframe);
+
+        for (const structure of structures) {
+          await supabase.from('market_structures').insert({
+            user_id: user?.id,
+            capture_id: captureId,
+            structure_type: structure.type,
+            direction: structure.direction,
+            price_level: structure.priceLevel,
+            confidence: structure.confidence,
+            timeframe: timeframe,
+            coordinates: structure.coordinates,
+          });
+        }
+      }
+
+      await supabase
+        .from('chart_captures')
+        .update({ analysis_status: 'completed' })
+        .eq('id', captureId);
+
+      setAnalysisStatus('Analysis complete!');
+      setTimeout(() => setAnalysisStatus(''), 3000);
+    } catch (error) {
+      console.error('Analysis error:', error);
+      setAnalysisStatus('Analysis failed');
+      setTimeout(() => setAnalysisStatus(''), 3000);
+    }
+  };
+
   const captureFrame = async () => {
     if (!videoRef.current || !canvasRef.current || !user || !stream) return;
 
@@ -93,6 +241,7 @@ export function ScreenCapture() {
       if (!blob) return;
 
       try {
+        setIsAnalyzing(true);
         const timestamp = new Date().toISOString();
         const fileName = `capture-${timestamp}.png`;
         const filePath = `${user.id}/${fileName}`;
@@ -115,19 +264,33 @@ export function ScreenCapture() {
         }
         const publicUrl = data.publicUrl;
 
-
-        const { error: dbError } = await supabase.from('chart_captures').insert({
-          user_id: user.id,
-          capture_url: publicUrl,
-          capture_timestamp: timestamp,
-          analysis_status: 'pending',
-        });
+        const { data: captureData, error: dbError } = await supabase
+          .from('chart_captures')
+          .insert({
+            user_id: user.id,
+            capture_url: publicUrl,
+            capture_timestamp: timestamp,
+            analysis_status: 'analyzing',
+          })
+          .select()
+          .single();
 
         if (dbError) throw dbError;
 
         setLastCapture(publicUrl);
+
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64 = reader.result as string;
+          const base64Data = base64.split(',')[1];
+          analyzeCapture(base64Data, captureData.id);
+        };
+        reader.readAsDataURL(blob);
       } catch (error) {
         console.error('Error saving capture:', error);
+        setIsAnalyzing(false);
+      } finally {
+        setIsAnalyzing(false);
       }
     }, 'image/png');
   };
@@ -167,10 +330,11 @@ export function ScreenCapture() {
               <>
                 <button
                   onClick={captureFrame}
-                  className="flex items-center gap-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white font-medium rounded-lg transition-all"
+                  disabled={isAnalyzing}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 disabled:bg-blue-500/50 text-white font-medium rounded-lg transition-all"
                 >
-                  <Square size={16} />
-                  Capture Now
+                  {isAnalyzing ? <Loader2 size={16} className="animate-spin" /> : <Square size={16} />}
+                  {isAnalyzing ? 'Analyzing...' : 'Capture Now'}
                 </button>
                 <button
                   onClick={stopCapture}
@@ -209,6 +373,15 @@ export function ScreenCapture() {
             />
             <span className="text-sm text-slate-300">seconds</span>
           </div>
+
+          {analysisStatus && (
+            <div className="mt-4 p-4 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+              <div className="flex items-center gap-2">
+                <Loader2 className="text-blue-400 animate-spin" size={16} />
+                <span className="text-sm font-medium text-blue-400">{analysisStatus}</span>
+              </div>
+            </div>
+          )}
 
           {isCapturing && (
             <div className="mt-4 p-4 bg-slate-900 rounded-lg border border-slate-700">
